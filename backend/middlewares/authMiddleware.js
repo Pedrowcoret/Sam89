@@ -57,11 +57,14 @@ const authMiddleware = async (req, res, next) => {
       }
 
       if (rows.length === 0) {
-        console.log('❌ Usuário não encontrado:', {
-          userId: decoded.userId,
-          tipo: decoded.tipo,
-          path: req.path
-        });
+        // Reduzir logs de usuário não encontrado
+        if (req.path !== '/api/health' && !req.path.includes('/status')) {
+          console.log('❌ Usuário não encontrado:', {
+            userId: decoded.userId,
+            tipo: decoded.tipo,
+            path: req.path
+          });
+        }
         return res.status(401).json({ error: 'Usuário não encontrado ou inativo' });
       }
 
@@ -80,21 +83,27 @@ const authMiddleware = async (req, res, next) => {
         codigo_servidor: user.codigo_servidor || null
       };
 
-      console.log('✅ Usuário autenticado:', {
-        id: user.codigo,
-        email: user.email,
-        usuario: user.usuario,
-        tipo: user.tipo,
-        path: req.path
-      });
+      // Reduzir logs de autenticação bem-sucedida
+      if (process.env.DEBUG_AUTH || (!req.path.includes('/status') && !req.path.includes('/health'))) {
+        console.log('✅ Usuário autenticado:', {
+          id: user.codigo,
+          email: user.email,
+          usuario: user.usuario,
+          tipo: user.tipo,
+          path: req.path
+        });
+      }
 
       next();
     } catch (jwtError) {
-      console.log('❌ Erro JWT:', {
-        error: jwtError.name,
-        message: jwtError.message,
-        path: req.path
-      });
+      // Reduzir logs de erro JWT
+      if (!req.path.includes('/status') && !req.path.includes('/health')) {
+        console.log('❌ Erro JWT:', {
+          error: jwtError.name,
+          message: jwtError.message,
+          path: req.path
+        });
+      }
       if (jwtError.name === 'TokenExpiredError') {
         return res.status(401).json({ error: 'Token expirado', expired: true });
       }

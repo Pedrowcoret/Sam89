@@ -156,23 +156,25 @@ router.get('/', authMiddleware, async (req, res) => {
     const userId = req.user.id;
     const userLogin = req.user.email ? req.user.email.split('@')[0] : `user_${userId}`;
     const folderId = req.query.folder_id;
+    
     if (!folderId) {
       return res.status(400).json({ error: 'folder_id é obrigatório' });
     }
 
-    // Buscar dados da pasta
+    // Buscar dados da pasta na nova tabela folders
     const [folderRows] = await db.execute(
-      'SELECT identificacao, codigo_servidor, espaco_usado FROM streamings WHERE codigo = ? AND codigo_cliente = ?',
+      'SELECT nome_sanitizado, servidor_id, espaco_usado FROM folders WHERE id = ? AND user_id = ?',
       [folderId, userId]
     );
+    
     if (folderRows.length === 0) {
       return res.status(404).json({ error: 'Pasta não encontrada' });
     }
 
     const folderData = folderRows[0];
-    const folderName = folderRows[0].identificacao;
-    const serverId = folderData.codigo_servidor || 1;
-    // Buscar vídeos na tabela videos usando pasta
+    const folderName = folderData.nome_sanitizado;
+    const serverId = folderData.servidor_id || 1;
+    // Buscar vídeos na tabela videos
     const [rows] = await db.execute(
       `SELECT 
         id,
@@ -195,67 +197,7 @@ router.get('/', authMiddleware, async (req, res) => {
     );
 
     console.log(`📁 Buscando vídeos na pasta: ${folderName} (ID: ${folderId})`);
-    console.log(`📊 Encontrados ${rows.length} vídeos no banco`);
-
-    // Sincronizar com servidor e atualizar informações
-    const VideoSSHManager = require('../config/VideoSSHManager');
-    const SSHManager = require('../config/SSHManager');
-    
-    let totalSizeUpdated = 0;
-    
-    for (const video of rows) {
-      try {
-        // Construir caminho correto no servidor
-        let serverPath = video.caminho;
-        if (!serverPath.startsWith('/home/streaming/')) {
-          serverPath = `/home/streaming/${userLogin}/${folderName}/${video.nome}`;
-        }
-        
-        // Verificar se arquivo existe e obter informações atualizadas
-        const fileInfo = await SSHManager.getFileInfo(serverId, serverPath);
-        
-        if (fileInfo.exists) {
-          // Atualizar informações se necessário
-          let needsUpdate = false;
-          const updates = [];
-          const values = [];
-          
-          if (!video.tamanho_arquivo && fileInfo.size > 0) {
-            updates.push('tamanho_arquivo = ?');
-            values.push(fileInfo.size);
-            video.tamanho = fileInfo.size;
-            needsUpdate = true;
-          }
-          
-          if (video.caminho !== serverPath) {
-            updates.push('caminho = ?');
-            values.push(serverPath);
-            needsUpdate = true;
-          }
-          
-          if (needsUpdate) {
-            values.push(video.id);
-            await db.execute(
-              `UPDATE videos SET ${updates.join(', ')} WHERE id = ?`,
-              values
-            );
-          }
-          
-          totalSizeUpdated += Math.ceil((video.tamanho || 0) / (1024 * 1024));
-        }
-      } catch (error) {
-        console.warn(`Erro ao verificar vídeo ${video.nome}:`, error.message);
-      }
-    }
-    
-    // Atualizar espaço usado da pasta se houve mudanças
-    if (totalSizeUpdated > 0 && Math.abs(totalSizeUpdated - (folderData.espaco_usado || 0)) > 5) {
-      await db.execute(
-        'UPDATE streamings SET espaco_usado = ? WHERE codigo = ?',
-        [totalSizeUpdated, folderId]
-      );
-      console.log(`📊 Espaço da pasta atualizado: ${totalSizeUpdated}MB`);
-    }
+    console.log(`📊 Encontrados ${rows.length} vídeos no banco para pasta ${folderName}`);
 
     const videos = rows.map(video => {
       // Construir URL correta baseada no caminho
@@ -287,8 +229,6 @@ router.get('/', authMiddleware, async (req, res) => {
           url = url.substring(1);
         }
       }
-
-      console.log(`🎥 Vídeo: ${video.nome} -> URL: ${url}`);
 
       // Buscar limite de bitrate do usuário
       const userBitrateLimit = req.user.bitrate || 2500;
@@ -362,7 +302,6 @@ router.get('/', authMiddleware, async (req, res) => {
       };
     });
 
-    console.log(`✅ Retornando ${videos.length} vídeos com informações de compatibilidade`);
     res.json(videos);
   } catch (err) {
     console.error('Erro ao buscar vídeos:', err);
@@ -695,11 +634,7 @@ router.get('/content/*', authMiddleware, async (req, res) => {
     
     if (!isVideoFile && !isStreamFile) {
       console.log(`❌ Tipo de arquivo não suportado: ${requestPath}`);
-      return res.status(404).json({ error: 'Arquivo não encontrado' });
-    }
-    
-    // Configurar headers para streaming de vídeo
-    res.setHeader('Access-Control-Allow-Origin', '*');
+        // Criar apenas a pasta específica (estrutura do usuário já deve existir)
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range');
     res.setHeader('Accept-Ranges', 'bytes');
@@ -708,11 +643,9 @@ router.get('/content/*', authMiddleware, async (req, res) => {
     if (isStreamFile && requestPath.includes('.m3u8')) {
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     } else if (isStreamFile && requestPath.includes('.ts')) {
-      res.setHeader('Content-Type', 'video/mp2t');
     } else if (requestPath.includes('.mp4')) {
       res.setHeader('Content-Type', 'video/mp4');
     } else if (requestPath.includes('.avi')) {
-      res.setHeader('Content-Type', 'video/x-msvideo');
     } else if (requestPath.includes('.mov')) {
       res.setHeader('Content-Type', 'video/quicktime');
     } else if (requestPath.includes('.wmv')) {
@@ -808,13 +741,15 @@ router.get('/content/*', authMiddleware, async (req, res) => {
       const requestHeaders = {
         'Range': req.headers.range || '',
         'User-Agent': 'Streaming-System/1.0',
-        'Accept': '*/*',
-        'Cache-Control': isStreamFile ? 'no-cache' : 'public, max-age=3600',
-        'Connection': 'keep-alive'
-      };
-      
-      const wowzaResponse = await fetch(wowzaUrl, {
-        method: req.method,
+        // Atualizar arquivo SMIL de forma assíncrona (não bloquear resposta)
+        setImmediate(async () => {
+          try {
+            const PlaylistSMILService = require('../services/PlaylistSMILService');
+            await PlaylistSMILService.updateUserSMIL(userId, userLogin, serverId);
+          } catch (smilError) {
+            console.warn('Erro ao atualizar arquivo SMIL:', smilError.message);
+          }
+        });
         headers: requestHeaders,
         timeout: 30000 // Timeout aumentado para melhor estabilidade
       });
@@ -826,14 +761,8 @@ router.get('/content/*', authMiddleware, async (req, res) => {
         if (finalFileName !== fileName) {
           console.log(`🔄 Tentando arquivo original: ${fileName}`);
           const originalUrl = isStreamFile ? 
-            `http://${wowzaHost}:1935/vod/_definst_/mp4:${userLogin}/${folderName}/${fileName}/playlist.m3u8` :
-            `http://${wowzaUser}:${wowzaPassword}@${wowzaHost}:${wowzaPort}/content/${userLogin}/${folderName}/${fileName}`;
-          
-          const originalResponse = await fetch(originalUrl, {
-            method: req.method,
-            headers: requestHeaders,
-            timeout: 30000
-          });
+          // Sincronização removida para evitar spam de requisições
+          console.log(`📁 Carregando vídeos da pasta ${selectedFolder} (sem sincronização automática)`);
           
           if (originalResponse.ok) {
             console.log(`✅ Servindo arquivo original do Wowza: ${originalUrl}`);

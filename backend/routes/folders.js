@@ -100,17 +100,12 @@ router.post('/', authMiddleware, async (req, res) => {
     );
 
     try {
-      // Garantir que estrutura completa do usuário existe
-      await SSHManager.createCompleteUserStructure(serverId, userLogin, {
-        bitrate: req.user.bitrate || 2500,
-        espectadores: req.user.espectadores || 100,
-        status_gravando: 'nao'
-      });
+      // Criar pasta no servidor de forma otimizada
+      const folderCreationResult = await SSHManager.createUserFolder(serverId, userLogin, sanitizedName);
       
-      // Criar a pasta específica no servidor via SSH no caminho correto
-      await SSHManager.createUserFolder(serverId, userLogin, sanitizedName);
-      
-      console.log(`✅ Pasta ${sanitizedName} criada no servidor`);
+      if (!folderCreationResult.success) {
+        throw new Error('Falha ao criar pasta no servidor');
+      }
       
     } catch (sshError) {
       console.error('Erro ao criar pasta no servidor:', sshError);
@@ -122,13 +117,15 @@ router.post('/', authMiddleware, async (req, res) => {
       });
     }
 
-    // Atualizar arquivo SMIL do usuário após criar pasta (fora do try/catch SSH)
-    try {
-      const PlaylistSMILService = require('../services/PlaylistSMILService');
-      await PlaylistSMILService.updateUserSMIL(userId, userLogin, serverId);
-    } catch (smilError) {
-      console.warn('Erro ao atualizar arquivo SMIL:', smilError.message);
-    }
+    // Atualizar arquivo SMIL de forma assíncrona (não bloquear resposta)
+    setImmediate(async () => {
+      try {
+        const PlaylistSMILService = require('../services/PlaylistSMILService');
+        await PlaylistSMILService.updateUserSMIL(userId, userLogin, serverId);
+      } catch (smilError) {
+        console.warn('Erro ao atualizar arquivo SMIL:', smilError.message);
+      }
+    });
 
     res.status(201).json({
       id: result.insertId,
@@ -461,14 +458,7 @@ router.post('/:id/sync', authMiddleware, async (req, res) => {
     const folderName = folder.nome_sanitizado;
 
     try {
-      // Garantir que estrutura completa do usuário existe
-      await SSHManager.createCompleteUserStructure(serverId, userLogin, {
-        bitrate: req.user.bitrate || 2500,
-        espectadores: req.user.espectadores || 100,
-        status_gravando: 'nao'
-      });
-      
-      // Garantir que pasta específica existe
+      // Criar apenas a pasta específica (estrutura do usuário já deve existir)
       await SSHManager.createUserFolder(serverId, userLogin, folderName);
       
       console.log(`✅ Pasta ${folderName} sincronizada`);

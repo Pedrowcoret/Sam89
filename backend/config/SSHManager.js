@@ -5,11 +5,51 @@ const path = require('path');
 class SSHManager {
     constructor() {
         this.connections = new Map();
-        this.lastErrorLogged = 0; // Para evitar spam de logs
+        this.lastErrorLogged = 0;
+        this.operationQueue = new Map(); // Fila de operações para evitar duplicatas
+        this.cooldownPeriod = 5000; // 5 segundos de cooldown entre operações similares
+    }
+
+    // Gerar chave única para operação
+    generateOperationKey(operation, ...params) {
+        return `${operation}_${params.join('_')}`;
+    }
+
+    // Verificar se operação está em cooldown
+    isOperationInCooldown(operationKey) {
+        const lastExecution = this.operationQueue.get(operationKey);
+        if (lastExecution && Date.now() - lastExecution < this.cooldownPeriod) {
+            console.log(`⏳ Operação ${operationKey} em cooldown, ignorando...`);
+            return true;
+        }
+        return false;
+    }
+
+    // Marcar operação como executada
+    markOperationExecuted(operationKey) {
+        this.operationQueue.set(operationKey, Date.now());
     }
 
     async getConnection(serverId) {
         try {
+            // Verificar cooldown para conexões
+            const connectionKey = `connection_${serverId}`;
+            if (this.isOperationInCooldown(connectionKey)) {
+                // Retornar conexão existente se disponível
+                const db = require('./database');
+                const [serverRows] = await db.execute(
+                    'SELECT ip, porta_ssh FROM wowza_servers WHERE codigo = ? AND status = "ativo"',
+                    [serverId]
+                );
+                if (serverRows.length > 0) {
+                    const server = serverRows[0];
+                    const existingKey = `${server.ip}:${server.porta_ssh}`;
+                    if (this.connections.has(existingKey)) {
+                        return this.connections.get(existingKey);
+                    }
+                }
+            }
+
             // Buscar dados do servidor no banco
             const db = require('./database');
             const [serverRows] = await db.execute(
@@ -49,6 +89,7 @@ class SSHManager {
                     };
                     
                     this.connections.set(connectionKey, connectionData);
+                    this.markOperationExecuted(`connection_${serverId}`);
                     resolve(connectionData);
                 });
 
@@ -158,8 +199,24 @@ class SSHManager {
 
     async createUserDirectory(serverId, userLogin) {
         try {
+            // Verificar cooldown para criação de diretório
+            const operationKey = this.generateOperationKey('createUserDirectory', serverId, userLogin);
+            if (this.isOperationInCooldown(operationKey)) {
+                console.log(`⏭️ Pulando criação de diretório (cooldown): ${userLogin}`);
+                return { success: true, userDir: `/home/streaming/${userLogin}` };
+            }
+
             // Nova estrutura: /home/streaming/[usuario]
             const userDir = `/home/streaming/${userLogin}`;
+            
+            // Verificar se diretório já existe antes de criar
+            const checkResult = await this.executeCommand(serverId, `test -d "${userDir}" && echo "EXISTS" || echo "NOT_EXISTS"`);
+            if (checkResult.stdout.includes('EXISTS')) {
+                console.log(`✅ Diretório já existe: ${userDir}`);
+                this.markOperationExecuted(operationKey);
+                return { success: true, userDir };
+            }
+
             const commands = [
                 `mkdir -p ${userDir}`,
                 `mkdir -p ${userDir}/recordings`,
@@ -171,7 +228,6 @@ class SSHManager {
             for (const command of commands) {
                 try {
                     const result = await this.executeCommand(serverId, command);
-                    console.log(`✅ Comando executado: ${command}`);
                     if (result.stderr) {
                         console.warn(`⚠️ Aviso no comando "${command}": ${result.stderr}`);
                     }
@@ -181,11 +237,9 @@ class SSHManager {
                 }
             }
 
-            console.log(`✅ Diretório criado para usuário ${userLogin} no servidor ${serverId}`);
+            console.log(`✅ Estrutura de diretório verificada/criada para usuário ${userLogin}`);
             
-            // Verificar se diretório foi criado
-            const checkResult = await this.executeCommand(serverId, `ls -la ${userDir}`);
-            console.log(`📁 Conteúdo do diretório ${userDir}:`, checkResult.stdout);
+            this.markOperationExecuted(operationKey);
             
             return { success: true, userDir };
         } catch (error) {
@@ -196,8 +250,24 @@ class SSHManager {
 
     async createUserFolder(serverId, userLogin, folderName) {
         try {
+            // Verificar cooldown para criação de pasta
+            const operationKey = this.generateOperationKey('createUserFolder', serverId, userLogin, folderName);
+            if (this.isOperationInCooldown(operationKey)) {
+                console.log(`⏭️ Pulando criação de pasta (cooldown): ${folderName}`);
+                return { success: true, folderPath: `/home/streaming/${userLogin}/${folderName}` };
+            }
+
             // Estrutura correta: /home/streaming/[usuario]/[pasta]
             const folderPath = `/home/streaming/${userLogin}/${folderName}`;
+            
+            // Verificar se pasta já existe
+            const checkResult = await this.executeCommand(serverId, `test -d "${folderPath}" && echo "EXISTS" || echo "NOT_EXISTS"`);
+            if (checkResult.stdout.includes('EXISTS')) {
+                console.log(`✅ Pasta já existe: ${folderPath}`);
+                this.markOperationExecuted(operationKey);
+                return { success: true, folderPath };
+            }
+
             const commands = [
                 `mkdir -p ${folderPath}`,
                 `chmod 755 ${folderPath}`,
@@ -216,17 +286,15 @@ class SSHManager {
                 }
             }
 
-            // Aguardar um momento para garantir que pasta foi criada
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Verificar se pasta foi criada (sem aguardar)
+            const finalCheckResult = await this.executeCommand(serverId, `test -d "${folderPath}" && echo "EXISTS" || echo "NOT_EXISTS"`);
             
-            // Verificar se pasta foi criada
-            const checkResult = await this.executeCommand(serverId, `test -d "${folderPath}" && echo "EXISTS" || echo "NOT_EXISTS"`);
-            
-            if (!checkResult.stdout.includes('EXISTS')) {
+            if (!finalCheckResult.stdout.includes('EXISTS')) {
                 throw new Error(`Pasta não foi criada: ${folderPath}`);
             }
             
             console.log(`✅ Pasta ${folderName} criada: ${folderPath}`);
+            this.markOperationExecuted(operationKey);
             
             return { success: true, folderPath };
         } catch (error) {
@@ -238,12 +306,19 @@ class SSHManager {
     // Criar estrutura completa do usuário (streaming + wowza)
     async createCompleteUserStructure(serverId, userLogin, userConfig) {
         try {
+            // Verificar cooldown para estrutura completa
+            const operationKey = this.generateOperationKey('createCompleteUserStructure', serverId, userLogin);
+            if (this.isOperationInCooldown(operationKey)) {
+                console.log(`⏭️ Pulando criação de estrutura completa (cooldown): ${userLogin}`);
+                return { success: true };
+            }
+
             console.log(`🏗️ Criando estrutura completa para usuário: ${userLogin}`);
 
             // Criar apenas estrutura básica de streaming
             await this.createUserDirectory(serverId, userLogin);
 
-            console.log(`✅ Estrutura completa criada para ${userLogin}`);
+            this.markOperationExecuted(operationKey);
             return { success: true };
 
         } catch (error) {
@@ -255,9 +330,21 @@ class SSHManager {
     // Verificar estrutura completa do usuário
     async checkCompleteUserStructure(serverId, userLogin) {
         try {
+            // Verificar cooldown para verificação de estrutura
+            const operationKey = this.generateOperationKey('checkCompleteUserStructure', serverId, userLogin);
+            if (this.isOperationInCooldown(operationKey)) {
+                // Retornar resultado em cache se disponível
+                return {
+                    streaming_directory: true,
+                    complete: true
+                };
+            }
+
             // Verificar estrutura de streaming
             const streamingPath = `/home/streaming/${userLogin}`;
             const streamingExists = await this.checkDirectoryExists(serverId, streamingPath);
+
+            this.markOperationExecuted(operationKey);
 
             return {
                 streaming_directory: streamingExists,
@@ -276,29 +363,75 @@ class SSHManager {
 
     async checkDirectoryExists(serverId, path) {
         try {
+            // Cache simples para verificações de diretório
+            const cacheKey = `dir_exists_${serverId}_${path}`;
+            const cached = this.operationQueue.get(cacheKey);
+            if (cached && Date.now() - cached.timestamp < 30000) { // Cache por 30 segundos
+                return cached.result;
+            }
+
             const command = `test -d "${path}" && echo "EXISTS" || echo "NOT_EXISTS"`;
             const result = await this.executeCommand(serverId, command);
-            return result.stdout.includes('EXISTS');
+            const exists = result.stdout.includes('EXISTS');
+            
+            // Salvar no cache
+            this.operationQueue.set(cacheKey, {
+                timestamp: Date.now(),
+                result: exists
+            });
+            
+            return exists;
         } catch (error) {
             console.warn(`Erro ao verificar diretório ${path}:`, error.message);
             return false;
         }
     }
 
+    // Limpar cache periodicamente
+    startCacheCleanup() {
+        setInterval(() => {
+            const now = Date.now();
+            for (const [key, value] of this.operationQueue.entries()) {
+                if (typeof value === 'object' && value.timestamp && now - value.timestamp > 60000) {
+                    this.operationQueue.delete(key);
+                } else if (typeof value === 'number' && now - value > this.cooldownPeriod * 2) {
+                    this.operationQueue.delete(key);
+                }
+            }
+        }, 60000); // Limpar a cada minuto
+    }
+
+    // Inicializar limpeza de cache
+    constructor() {
+        this.connections = new Map();
+        this.lastErrorLogged = 0;
+        this.operationQueue = new Map();
+        this.cooldownPeriod = 5000;
+        this.startCacheCleanup();
+    }
+
     // Método otimizado para verificar e obter informações de pasta
     async getFolderInfo(serverId, folderPath) {
         try {
+            // Cache para informações de pasta
+            const cacheKey = `folder_info_${serverId}_${folderPath}`;
+            const cached = this.operationQueue.get(cacheKey);
+            if (cached && Date.now() - cached.timestamp < 15000) { // Cache por 15 segundos
+                return cached.result;
+            }
+
             // Comando combinado para verificar existência e obter informações
             const command = `if [ -d "${folderPath}" ]; then echo "EXISTS"; find "${folderPath}" -type f | wc -l; du -sb "${folderPath}" 2>/dev/null | cut -f1 || echo "0"; else echo "NOT_EXISTS"; fi`;
             const result = await this.executeCommand(serverId, command);
             
             const lines = result.stdout.trim().split('\n');
             
+            let folderInfo;
             if (lines[0] === 'EXISTS') {
                 const fileCount = parseInt(lines[1]) || 0;
                 const sizeBytes = parseInt(lines[2]) || 0;
                 
-                return {
+                folderInfo = {
                     exists: true,
                     file_count: fileCount,
                     size_bytes: sizeBytes,
@@ -306,7 +439,7 @@ class SSHManager {
                     path: folderPath
                 };
             } else {
-                return {
+                folderInfo = {
                     exists: false,
                     file_count: 0,
                     size_bytes: 0,
@@ -314,6 +447,14 @@ class SSHManager {
                     path: folderPath
                 };
             }
+
+            // Salvar no cache
+            this.operationQueue.set(cacheKey, {
+                timestamp: Date.now(),
+                result: folderInfo
+            });
+
+            return folderInfo;
         } catch (error) {
             console.warn(`Erro ao obter informações da pasta ${folderPath}:`, error.message);
             return {

@@ -21,6 +21,15 @@ class WowzaStreamingService {
 
     async initializeFromDatabase(userId) {
         try {
+            // Cache de inicialização para evitar múltiplas inicializações
+            const cacheKey = `init_${userId}`;
+            if (this.operationQueue && this.operationQueue.has(cacheKey)) {
+                const cached = this.operationQueue.get(cacheKey);
+                if (Date.now() - cached.timestamp < 60000) { // Cache por 1 minuto
+                    return cached.result;
+                }
+            }
+
             // Buscar dados do servidor Wowza baseado no usuário
             let serverId = this.serverId;
 
@@ -88,21 +97,16 @@ class WowzaStreamingService {
                 this.baseUrl = `http://${this.wowzaHost}:${this.wowzaPort}/v2/servers/_defaultServer_/vhosts/_defaultVHost_`;
                 this.client = new DigestFetch(this.wowzaUser, this.wowzaPassword);
 
-                console.log(`✅ Wowza: ${server.nome} (${this.wowzaHost}:${this.wowzaPort})`);
-
-                // Testar conexão com timeout e retry
-                try {
-                    const testResult = await this.testConnectionWithRetry();
-                    if (testResult.success) {
-                        console.log(`✅ Wowza API: Online`);
-                    } else {
-                        console.log(`⚠️ Wowza API: Offline - Modo degradado ativo`);
-                    }
-                } catch (testError) {
-                    console.log(`⚠️ Wowza API: Indisponível - Modo degradado ativo`);
+                // Cache do resultado da inicialização
+                const initResult = true;
+                if (this.operationQueue) {
+                    this.operationQueue.set(cacheKey, {
+                        timestamp: Date.now(),
+                        result: initResult
+                    });
                 }
 
-                return true;
+                return initResult;
             } else {
                 console.error('❌ Nenhum servidor Wowza ativo encontrado');
                 return false;
@@ -119,6 +123,14 @@ class WowzaStreamingService {
             return { success: false, error: 'Wowza não inicializado', fallback: true };
         }
 
+        // Implementar rate limiting para evitar spam
+        const rateLimitKey = `wowza_request_${endpoint}_${method}`;
+        const lastRequest = this.operationQueue?.get(rateLimitKey);
+        if (lastRequest && Date.now() - lastRequest < 1000) { // 1 segundo entre requisições similares
+            console.log(`⏳ Rate limit ativo para ${endpoint}, pulando requisição`);
+            return { success: false, error: 'Rate limit ativo', rate_limited: true };
+        }
+
         try {
             const url = `${this.baseUrl}${endpoint}`;
             const options = {
@@ -127,22 +139,22 @@ class WowzaStreamingService {
                     'Accept': 'application/json',
                     'Content-Type': 'application/json',
                 },
-                timeout: 10000, // 10 segundos timeout
+                timeout: 5000, // Reduzir timeout para 5 segundos
             };
 
             if (data) {
                 options.body = JSON.stringify(data);
             }
 
-            // Reduzir logs - apenas para debug quando necessário
-            if (process.env.DEBUG_WOWZA) {
-                console.log(`🔗 Wowza: ${method} ${endpoint}`);
+            // Marcar requisição no rate limit
+            if (this.operationQueue) {
+                this.operationQueue.set(rateLimitKey, Date.now());
             }
 
             const response = await Promise.race([
                 this.client.fetch(url, options),
                 new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Timeout na requisição Wowza')), 10000)
+                    setTimeout(() => reject(new Error('Timeout na requisição Wowza')), 5000)
                 )
             ]);
 
@@ -155,19 +167,14 @@ class WowzaStreamingService {
                 parsedData = text;
             }
 
-            if (!response.ok) {
-                if (process.env.DEBUG_WOWZA) {
-                    console.error(`❌ Wowza HTTP ${response.status}:`, parsedData);
-                }
-            }
             return {
                 statusCode: response.status,
                 data: parsedData,
                 success: response.ok
             };
         } catch (error) {
-            // Reduzir logs de erro repetitivos
-            if (!this.lastErrorLogged || Date.now() - this.lastErrorLogged > 60000) {
+            // Reduzir logs de erro repetitivos para 5 minutos
+            if (!this.lastErrorLogged || Date.now() - this.lastErrorLogged > 300000) {
                 console.error(`❌ Wowza ${this.wowzaHost}:${this.wowzaPort} - ${error.message}`);
                 this.lastErrorLogged = Date.now();
             }
@@ -183,6 +190,22 @@ class WowzaStreamingService {
 
             return { success: false, error: errorMessage, code: error.code };
         }
+    }
+
+    constructor(serverId = null) {
+        this.serverId = serverId;
+        this.wowzaHost = null;
+        this.wowzaPassword = null;
+        this.wowzaUser = null;
+        this.wowzaPort = null;
+        this.wowzaApplication = process.env.WOWZA_APPLICATION || 'live';
+        this.baseUrl = null;
+        this.client = null;
+        this.activeStreams = new Map();
+        this.obsStreams = new Map();
+        this.lastErrorLogged = 0;
+        this.connectionAttempts = 0;
+        this.operationQueue = new Map(); // Para rate limiting
     }
 
     async ensureApplication(appName = null) {
@@ -1106,65 +1129,46 @@ class WowzaStreamingService {
     async testConnectionWithRetry(maxRetries = 3, retryDelay = 2000) {
         this.connectionAttempts++;
 
-        // Evitar spam de tentativas - máximo 1 teste por minuto
-        if (this.connectionAttempts > 1 && Date.now() - this.lastErrorLogged < 60000) {
+        // Evitar spam de tentativas - máximo 1 teste por 5 minutos
+        if (this.connectionAttempts > 1 && Date.now() - this.lastErrorLogged < 300000) {
             return {
                 success: false,
                 connected: false,
-                error: 'Muitas tentativas recentes',
+                error: 'Teste de conexão em cooldown',
                 attempts: 0
             };
         }
 
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        // Reduzir tentativas para 1 apenas
+        for (let attempt = 1; attempt <= 1; attempt++) {
             try {
-                if (attempt === 1) {
-                    console.log(`🔍 Testando Wowza: ${this.wowzaHost}:${this.wowzaPort}`);
-                }
-
                 const result = await this.makeWowzaRequest(`/applications`);
 
                 if (result.success) {
-                    if (attempt > 1) {
-                        console.log(`✅ Wowza conectado na tentativa ${attempt}`);
-                    }
                     return {
                         success: true,
                         connected: true,
                         data: result.data,
                         attempts: attempt
                     };
-                } else {
-                    if (attempt === maxRetries) {
-                        console.log(`❌ Wowza: ${result.error}`);
-                    }
-
-                    // Se não é a última tentativa, aguardar antes de tentar novamente
-                    if (attempt < maxRetries) {
-                        await new Promise(resolve => setTimeout(resolve, retryDelay));
-                    }
                 }
             } catch (error) {
-                if (attempt === maxRetries) {
+                // Log apenas se for erro crítico
+                if (error.code !== 'ECONNREFUSED' && error.code !== 'ETIMEDOUT') {
                     console.error(`❌ Wowza: ${error.message}`);
-                }
-
-                // Se não é a última tentativa, aguardar antes de tentar novamente
-                if (attempt < maxRetries) {
-                    await new Promise(resolve => setTimeout(resolve, retryDelay));
                 }
             }
         }
 
         // Todas as tentativas falharam
-        const finalError = `Wowza API indisponível após ${maxRetries} tentativas`;
+        const finalError = `Wowza API indisponível`;
         this.lastErrorLogged = Date.now();
 
         return {
             success: false,
             connected: false,
             error: finalError,
-            attempts: maxRetries
+            attempts: 1
         };
     }
 

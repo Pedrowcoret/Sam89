@@ -110,14 +110,6 @@ const GerenciarVideos: React.FC = () => {
         setFolders(prev => prev.map(f =>
           f.id.toString() === folderId ? { ...f, ...folderInfo } : f
         ));
-        
-        // Se pasta foi criada recentemente e não existe no servidor, sincronizar
-        if (folderInfo.server_info && !folderInfo.server_info.exists) {
-          console.log('Pasta não detectada no servidor, tentando sincronizar...');
-          setTimeout(() => {
-            syncFolder(folderId);
-          }, 2000);
-        }
       }
     } catch (error) {
       console.error('Erro ao carregar informações da pasta:', error);
@@ -131,17 +123,7 @@ const GerenciarVideos: React.FC = () => {
     try {
       const token = await getToken();
       
-      // Primeiro, sincronizar com servidor
-      await fetch(`/api/videos-ssh/sync-database`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({ folderId: selectedFolder })
-      });
-      
-      // Depois carregar vídeos atualizados
+      // Carregar vídeos diretamente (sem sincronização automática)
       const response = await fetch(`/api/videos?folder_id=${selectedFolder}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -179,17 +161,10 @@ const GerenciarVideos: React.FC = () => {
         setShowNewFolderModal(false);
         setNewFolderName('');
         
-        // Aguardar um pouco antes de recarregar para dar tempo da pasta ser criada
-        setTimeout(() => {
-          loadFolders();
-        }, 1500);
+        // Recarregar pastas imediatamente
+        loadFolders();
         
         setSelectedFolder(newFolder.id.toString());
-        
-        // Carregar informações da pasta após criação
-        setTimeout(() => {
-          loadFolderInfo(newFolder.id.toString());
-        }, 3000);
       } else {
         const errorData = await response.json();
         toast.error(errorData.error || 'Erro ao criar pasta');
@@ -223,7 +198,6 @@ const GerenciarVideos: React.FC = () => {
         setEditingFolder(null);
         setEditFolderName('');
         loadFolders();
-        loadVideos(); // Recarregar vídeos para atualizar URLs
       } else {
         const errorData = await response.json();
         toast.error(errorData.error || 'Erro ao renomear pasta');
@@ -268,6 +242,18 @@ const GerenciarVideos: React.FC = () => {
   const syncFolder = async (folderId: string) => {
     try {
       const token = await getToken();
+      
+      // Primeiro sincronizar com banco de dados
+      await fetch(`/api/videos-ssh/sync-database`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ folderId })
+      });
+      
+      // Depois sincronizar pasta no servidor
       const response = await fetch(`/api/folders/${folderId}/sync`, {
         method: 'POST',
         headers: {
@@ -279,6 +265,7 @@ const GerenciarVideos: React.FC = () => {
       if (response.ok) {
         toast.success('Pasta sincronizada com servidor!');
         loadFolderInfo(folderId);
+        loadVideos(); // Recarregar vídeos após sincronização
       } else {
         const errorData = await response.json();
         toast.error(errorData.error || 'Erro ao sincronizar pasta');
@@ -661,6 +648,14 @@ const GerenciarVideos: React.FC = () => {
             </div>
             <div className="flex items-center space-x-3">
               <button
+                onClick={() => syncFolder(selectedFolder)}
+                className="text-blue-600 hover:text-blue-800 flex items-center text-sm"
+                title="Sincronizar com servidor"
+              >
+                <RefreshCw className="h-4 w-4 mr-1" />
+                Sincronizar
+              </button>
+              <button
                 onClick={loadVideos}
                 disabled={loading}
                 className="text-primary-600 hover:text-primary-800"
@@ -863,7 +858,7 @@ const GerenciarVideos: React.FC = () => {
                 <div>
                   <span className="text-gray-600">Espaço usado:</span>
                   <span className="ml-2 font-medium">
-                    {selectedFolderData.espaco_usado || 0} MB / {selectedFolderData.espaco || 1000} MB
+                    {selectedFolderData.espaco_usado || 0} MB
                   </span>
                 </div>
               </div>
@@ -872,6 +867,22 @@ const GerenciarVideos: React.FC = () => {
                 <div className="mt-2 text-xs text-gray-500">
                   <span>Caminho no servidor:</span>
                   <span className="ml-2 font-mono">{selectedFolderData.server_info.path}</span>
+                </div>
+              )}
+              
+              {selectedFolderData.server_info && !selectedFolderData.server_info.exists && (
+                <div className="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+                  <div className="flex items-center justify-between">
+                    <p className="text-yellow-800 text-sm">
+                      ⚠️ Pasta não existe no servidor. Clique em "Sincronizar" para criar.
+                    </p>
+                    <button
+                      onClick={() => syncFolder(selectedFolder)}
+                      className="bg-yellow-600 text-white px-3 py-1 rounded text-xs hover:bg-yellow-700"
+                    >
+                      Sincronizar Agora
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
